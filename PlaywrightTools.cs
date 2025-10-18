@@ -53,6 +53,81 @@ public static class PlaywrightTools
         return await page.ContentAsync();
     }
 
+    [McpServerTool, Description("Takes an accessibility snapshot of the page and returns it as a JSON string.")]
+    public static async Task<string> GetAccessibilitySnapshot(string pageId)
+    {
+        EnsureManager();
+        var page = _manager!.GetPage(pageId);
+
+        try
+        {
+            // Prefer the strongly-typed API if available: page.Accessibility.SnapshotAsync()
+            var accessibilityProp = page.GetType().GetProperty("Accessibility");
+            if (accessibilityProp != null)
+            {
+                var accessibilityObj = accessibilityProp.GetValue(page);
+                if (accessibilityObj != null)
+                {
+                    var snapshotMethod = accessibilityObj.GetType().GetMethod("SnapshotAsync", new Type[] { });
+                    if (snapshotMethod != null)
+                    {
+                        var task = (System.Threading.Tasks.Task)snapshotMethod.Invoke(accessibilityObj, null)!;
+                        await task.ConfigureAwait(false);
+                        // Task<TResult> -> get Result
+                        var resultProp = task.GetType().GetProperty("Result");
+                        var result = resultProp?.GetValue(task);
+                        // Serialize to JSON using System.Text.Json
+                        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = false });
+                    }
+                }
+            }
+
+            // Fallback: try invoking page.EvaluateAsync to call accessibility snapshot in-page
+            try
+            {
+                var evalMethod = page.GetType().GetMethod("EvaluateAsync", new Type[] { typeof(string) });
+                if (evalMethod != null)
+                {
+                    // This fallback attempts to run a small script to collect accessible name/role tree — limited but better than nothing.
+                    string script = @"(()=>{
+                        function nodeToObj(n){
+                            const obj={role:n.role, name:n.name, value:n.value, children:[]};
+                            if(n.children) for(const c of n.children) obj.children.push(nodeToObj(c));
+                            return obj;
+                        }
+                        try{ const root = (window.__playwright_accessibility_snapshot && window.__playwright_accessibility_snapshot()) || null; return root; }catch(e){ return null; }
+                    })()";
+                    var task = (System.Threading.Tasks.Task)evalMethod.Invoke(page, new object[] { script })!;
+                    await task.ConfigureAwait(false);
+                    var resProp = task.GetType().GetProperty("Result");
+                    var res = resProp?.GetValue(task);
+                    return JsonSerializer.Serialize(res, new JsonSerializerOptions { WriteIndented = false });
+                }
+            }
+            catch { /* swallow fallback errors */ }
+        }
+        catch { /* swallow */ }
+
+        // As a last resort, return an empty JSON object
+        return "{}";
+    }
+
+    [McpServerTool, Description("Takes an accessibility snapshot of the page and saves it to the given file path. Returns the file path on success.")]
+    public static async Task<string> SaveAccessibilitySnapshot(string pageId, string filePath)
+    {
+        EnsureManager();
+        var json = await GetAccessibilitySnapshot(pageId);
+        try
+        {
+            System.IO.File.WriteAllText(filePath, json, Encoding.UTF8);
+            return filePath;
+        }
+        catch (System.Exception ex)
+        {
+            throw new System.InvalidOperationException($"Failed to write accessibility snapshot to file: {ex.Message}");
+        }
+    }
+
     [McpServerTool, Description("Clicks a selector on the page.")]
     public static async Task Click(string pageId, string selector)
     {
