@@ -26,12 +26,12 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-// If user didn't provide a user data dir, create a temporary directory to use during this run.
+// If user didn't provide a user data dir, use a permanent directory on the Desktop.
 if (string.IsNullOrWhiteSpace(userDataDir))
 {
-    var tmp = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "playwright-user-data-" + Guid.NewGuid().ToString("N"));
-    System.IO.Directory.CreateDirectory(tmp);
-    userDataDir = tmp;
+    var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+    var permanent = Path.Combine(desktopPath, "playwright-user-data");
+    userDataDir = permanent;
 }
 
 var builder = Host.CreateApplicationBuilder(args);

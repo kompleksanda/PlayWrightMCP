@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Playwright;
 
 [McpServerToolType]
 public static class PlaywrightTools
@@ -16,14 +17,14 @@ public static class PlaywrightTools
     public static void SetManager(PlaywrightManager manager) => _manager = manager;
 
     // --- existing basic helpers ---
-    [McpServerTool, Description("Launches a Chromium browser and returns a browserId.")]
+    [McpServerTool, Description("Launches a Chromium browser and returns a browserId. You should only call this once and reuse the browserId for multiple contexts/pages. Call the new context tool next.")]
     public static async Task<string> LaunchBrowser(bool headless = true)
     {
         EnsureManager();
         return await _manager!.LaunchBrowserAsync(headless);
     }
 
-    [McpServerTool, Description("Creates a new browser context for given browserId and returns contextId.")]
+    [McpServerTool, Description("Creates a new browser context for given browserId and returns contextId. Call the new page tool next.")]
     public static async Task<string> NewContext(string browserId)
     {
         EnsureManager();
@@ -41,8 +42,71 @@ public static class PlaywrightTools
     public static async Task Navigate(string pageId, string url)
     {
         EnsureManager();
+        if (string.IsNullOrWhiteSpace(pageId)) throw new ArgumentException("pageId is required", nameof(pageId));
+        if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("url is required", nameof(url));
+
         var page = _manager!.GetPage(pageId);
-        await page.GotoAsync(url);
+        if (page == null) throw new ArgumentException("Unknown pageId", nameof(pageId));
+
+        // If the page is closed, surface a clear error
+        try
+        {
+            // IPage exposes IsClosed in Playwright .NET
+            if (page.IsClosed)
+                throw new InvalidOperationException("The requested page is already closed.");
+        }
+        catch
+        {
+            // If introspection fails, continue and let GotoAsync report the error
+        }
+
+        // Normalize/validate URL: if no scheme is provided, try http:// prefix
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != "file" && uri.Scheme != "about"))
+        {
+            if (Uri.TryCreate("http://" + url, UriKind.Absolute, out var tryUri))
+            {
+                url = tryUri.ToString();
+            }
+            else
+            {
+                throw new ArgumentException($"Invalid URL: '{url}'", nameof(url));
+            }
+        }
+
+        // Try a few sensible navigation strategies when timeouts occur on slow or resource-heavy sites.
+        try
+        {
+            // Primary attempt: wait for network idle (most complete state) with a 30s timeout
+            await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
+            return;
+        }
+        catch (TimeoutException firstTimeout)
+        {
+            // Fallback 1: wait for full load with a longer timeout (some pages take longer to load resources)
+            try
+            {
+                await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.Load, Timeout = 60000 });
+                return;
+            }
+            catch (TimeoutException secondTimeout)
+            {
+                // Final fallback: navigate and return once navigation is committed (don't wait for network)
+                try
+                {
+                    await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.Commit, Timeout = 15000 });
+                    return;
+                }
+                catch (Exception finalEx)
+                {
+                    throw new InvalidOperationException($"Navigation to '{url}' failed after multiple attempts: first timeout={firstTimeout.Message}; second timeout={secondTimeout.Message}; final error={finalEx.Message}", finalEx);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            // Non-timeout error: provide context
+            throw new InvalidOperationException($"Navigation to '{url}' failed: {ex.Message}", ex);
+        }
     }
 
     [McpServerTool, Description("Gets the page content (outer HTML of document).")]
@@ -50,90 +114,68 @@ public static class PlaywrightTools
     {
         EnsureManager();
         var page = _manager!.GetPage(pageId);
-        return await page.ContentAsync();
+        var content = await page.ContentAsync();
+        if (string.IsNullOrEmpty(content)) return content;
+
+        // If content is small enough, return directly and remove any cached pages
+        if (Encoding.UTF8.GetByteCount(content) <= DefaultContentChunkSize)
+        {
+            _contentPages.TryRemove(pageId, out var _);
+            return content;
+        }
+        // Return content truncated to chunk size limit for immediate response
+        _contentPages.TryRemove(pageId, out var _);
+        return content.Substring(0, Math.Min(content.Length, DefaultContentChunkSize));
+
+        // Otherwise split into pages and store; return a small JSON metadata object pointing to pagination
+        //PrepareContentPages(pageId, content);
+        //var meta = new { paginated = true, pageCount = GetContentPageCount(pageId) };
+        //return JsonSerializer.Serialize(meta);
     }
 
-    [McpServerTool, Description("Takes an accessibility snapshot of the page and returns it as a JSON string.")]
-    public static async Task<string> GetAccessibilitySnapshot(string pageId)
+    // Helper to split and store content into chunks (preserving UTF8 boundaries heuristically)
+    private static void PrepareContentPages(string pageId, string content)
     {
-        EnsureManager();
-        var page = _manager!.GetPage(pageId);
+        // Estimate total bytes
+        var totalBytes = Encoding.UTF8.GetByteCount(content);
+        var pages = (int)Math.Ceiling((double)totalBytes / DefaultContentChunkSize);
+        var map = new ConcurrentDictionary<int, string>();
 
-        try
+        int charPos = 0;
+        for (int i = 0; i < pages && charPos < content.Length; i++)
         {
-            // Prefer the strongly-typed API if available: page.Accessibility.SnapshotAsync()
-            var accessibilityProp = page.GetType().GetProperty("Accessibility");
-            if (accessibilityProp != null)
+            // Start with a heuristic char length: average 1 byte per char is optimistic; cap at remaining
+            int take = Math.Min(content.Length - charPos, DefaultContentChunkSize);
+
+            // Reduce take until byte count fits
+            while (take > 0 && Encoding.UTF8.GetByteCount(content.AsSpan(charPos, Math.Min(take, content.Length - charPos))) > DefaultContentChunkSize)
             {
-                var accessibilityObj = accessibilityProp.GetValue(page);
-                if (accessibilityObj != null)
-                {
-                    var snapshotMethod = accessibilityObj.GetType().GetMethod("SnapshotAsync", new Type[] { });
-                    if (snapshotMethod != null)
-                    {
-                        var task = (System.Threading.Tasks.Task)snapshotMethod.Invoke(accessibilityObj, null)!;
-                        await task.ConfigureAwait(false);
-                        // Task<TResult> -> get Result
-                        var resultProp = task.GetType().GetProperty("Result");
-                        var result = resultProp?.GetValue(task);
-                        // Serialize to JSON using System.Text.Json
-                        return JsonSerializer.Serialize(result, new JsonSerializerOptions { WriteIndented = false });
-                    }
-                }
+                take = Math.Max(1, take - 256);
             }
 
-            // Fallback: try invoking page.EvaluateAsync to call accessibility snapshot in-page
-            try
-            {
-                var evalMethod = page.GetType().GetMethod("EvaluateAsync", new Type[] { typeof(string) });
-                if (evalMethod != null)
-                {
-                    // This fallback attempts to run a small script to collect accessible name/role tree — limited but better than nothing.
-                    string script = @"(()=>{
-                        function nodeToObj(n){
-                            const obj={role:n.role, name:n.name, value:n.value, children:[]};
-                            if(n.children) for(const c of n.children) obj.children.push(nodeToObj(c));
-                            return obj;
-                        }
-                        try{ const root = (window.__playwright_accessibility_snapshot && window.__playwright_accessibility_snapshot()) || null; return root; }catch(e){ return null; }
-                    })()";
-                    var task = (System.Threading.Tasks.Task)evalMethod.Invoke(page, new object[] { script })!;
-                    await task.ConfigureAwait(false);
-                    var resProp = task.GetType().GetProperty("Result");
-                    var res = resProp?.GetValue(task);
-                    return JsonSerializer.Serialize(res, new JsonSerializerOptions { WriteIndented = false });
-                }
-            }
-            catch { /* swallow fallback errors */ }
+            var chunk = content.Substring(charPos, Math.Min(take, content.Length - charPos));
+            map[i] = chunk;
+            charPos += chunk.Length;
         }
-        catch { /* swallow */ }
 
-        // As a last resort, return an empty JSON object
-        return "{}";
+        _contentPages[pageId] = map;
     }
 
-    [McpServerTool, Description("Takes an accessibility snapshot of the page and saves it to the given file path. Returns the file path on success.")]
-    public static async Task<string> SaveAccessibilitySnapshot(string pageId, string filePath)
+    [McpServerTool, Description("Get number of content pages for a paginated page content.")]
+    public static int GetContentPageCount(string pageId)
     {
         EnsureManager();
-        var json = await GetAccessibilitySnapshot(pageId);
-        try
-        {
-            System.IO.File.WriteAllText(filePath, json, Encoding.UTF8);
-            return filePath;
-        }
-        catch (System.Exception ex)
-        {
-            throw new System.InvalidOperationException($"Failed to write accessibility snapshot to file: {ex.Message}");
-        }
+        if (!_contentPages.TryGetValue(pageId, out var map)) return 0;
+        return map.Count;
     }
 
-    [McpServerTool, Description("Clicks a selector on the page.")]
-    public static async Task Click(string pageId, string selector)
+    [McpServerTool, Description("Get a specific content page (chunk) by zero-based index. Returns null if not available. Call this tool and process its results one at a time (You have a max of 1048576 input tokens so you don't exceed it, ensure you process that information before calling the next page)")]
+    public static string? GetContentPage(string pageId, int pageIndex)
     {
         EnsureManager();
-        var page = _manager!.GetPage(pageId);
-        await page.ClickAsync(selector);
+        if (!_contentPages.TryGetValue(pageId, out var map)) return null;
+        if (!map.TryGetValue(pageIndex, out var chunk)) return null;
+        return chunk;
     }
 
     [McpServerTool, Description("Types text into selector on the page.")]
@@ -156,6 +198,9 @@ public static class PlaywrightTools
 
     // Thread-safe storage for captured data per page
     private static readonly ConcurrentDictionary<string, ConcurrentQueue<object>> _consoleLogs = new();
+    // Chunked HTML/content storage: pageId -> (pageIndex -> chunk)
+    private const int DefaultContentChunkSize = 512 * 2 * 1024; // 512 * 2 KB per chunk
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, string>> _contentPages = new();
     // Network transactions: pageId -> (transactionId -> transaction)
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, NetworkTransaction>> _networkTransactions = new();
     // Preserve order of transaction ids per page
@@ -533,6 +578,7 @@ public static class PlaywrightTools
         _networkTransactions[pageId] = new ConcurrentDictionary<string, NetworkTransaction>();
         _networkOrder[pageId] = new ConcurrentQueue<string>();
         _sources[pageId] = new ConcurrentDictionary<string, string>();
+        _contentPages[pageId] = new ConcurrentDictionary<int, string>();
     }
 
     private static void EnsureManager()

@@ -4,5 +4,5 @@ public sealed class PlaywrightOptions
     public string? UserDataDir { get; set; }
 
     // Whether to launch browsers in headless mode.
-    public bool Headless { get; set; } = false;
+    public bool Headless { get; set; }
 }
