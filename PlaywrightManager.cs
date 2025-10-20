@@ -10,6 +10,10 @@ public sealed class PlaywrightManager : IAsyncDisposable
     private readonly PlaywrightOptions _options;
     private readonly ConcurrentDictionary<string, IBrowser> _browsers = new();
     private readonly ConcurrentDictionary<string, IBrowserContext> _contexts = new();
+    // map pageId -> contextId and contextId -> collection of pageIds
+    private readonly ConcurrentDictionary<string, string> _pageToContext = new();
+    // contextId -> (pageId -> dummy) to allow removal when pages close
+    private readonly ConcurrentDictionary<string, System.Collections.Concurrent.ConcurrentDictionary<string, byte>> _contextToPages = new();
     // When we launch a persistent context (via userDataDir) we return a browserId but
     // actually hold the persistent IBrowserContext. This map lets us translate that
     // browserId back to the context id so callers of NewContext can get a valid context.
@@ -93,6 +97,14 @@ public sealed class PlaywrightManager : IAsyncDisposable
         var page = await context.NewPageAsync();
         var id = Guid.NewGuid().ToString();
         _pages[id] = page;
+        // record mapping from page to context and add to context->pages map
+        try
+        {
+            _pageToContext[id] = contextId;
+            var map = _contextToPages.GetOrAdd(contextId, _ => new System.Collections.Concurrent.ConcurrentDictionary<string, byte>());
+            map.TryAdd(id, 0);
+        }
+        catch { }
         return id;
     }
 
@@ -119,5 +131,77 @@ public sealed class PlaywrightManager : IAsyncDisposable
         foreach (var b in _browsers.Values)
             try { await b.CloseAsync(); } catch { }
         try { _pw?.Dispose(); } catch { }
+    }
+
+    // Return all known context ids
+    public string[] ListContexts()
+    {
+        return _contexts.Keys.ToArray();
+    }
+
+    // Return page ids for a given context id (empty array if none)
+    public string[] ListPages(string contextId)
+    {
+        if (string.IsNullOrEmpty(contextId)) return Array.Empty<string>();
+
+        // If we don't have the context, return empty
+        if (!_contexts.TryGetValue(contextId, out var context)) return Array.Empty<string>();
+
+        var livePageIds = new List<string>();
+
+        // Enumerate actual pages from the context to detect externally-created pages
+        try
+        {
+            var pages = context.Pages; // IReadOnlyList<IPage>
+            foreach (var p in pages)
+            {
+                if (p is null) continue;
+
+                // Skip closed pages but still clean up recorded entries later
+                bool isClosed = false;
+                try { isClosed = p.IsClosed; } catch { }
+
+                if (isClosed) continue;
+
+                // Try to find existing pageId for this IPage instance
+                string? foundId = null;
+                foreach (var kv in _pages)
+                {
+                    if (object.ReferenceEquals(kv.Value, p)) { foundId = kv.Key; break; }
+                }
+
+                if (foundId is null)
+                {
+                    // New external page - register it
+                    var newId = Guid.NewGuid().ToString();
+                    _pages[newId] = p;
+                    _pageToContext[newId] = contextId;
+                    var map = _contextToPages.GetOrAdd(contextId, _ => new System.Collections.Concurrent.ConcurrentDictionary<string, byte>());
+                    map.TryAdd(newId, 0);
+                    foundId = newId;
+                }
+
+                if (foundId is not null) livePageIds.Add(foundId);
+            }
+        }
+        catch { /* ignore Playwright introspection errors */ }
+
+        // Cleanup recorded pages for the context that no longer exist or are closed
+        if (_contextToPages.TryGetValue(contextId, out var recorded))
+        {
+            var recordedIds = recorded.Keys.ToArray();
+            foreach (var pid in recordedIds)
+            {
+                // if recorded id not found in livePageIds, remove
+                if (!livePageIds.Contains(pid))
+                {
+                    recorded.TryRemove(pid, out var _);
+                    _pages.TryRemove(pid, out var _);
+                    _pageToContext.TryRemove(pid, out var _);
+                }
+            }
+        }
+
+        return livePageIds.ToArray();
     }
 }

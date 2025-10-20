@@ -109,7 +109,7 @@ public static class PlaywrightTools
         }
     }
 
-    [McpServerTool, Description("Gets the page content (outer HTML of document).")]
+    [McpServerTool, Description("Gets the page content (outer HTML of document). Use GetAccessibilitySnapshot instead. Do not call this unless necessary as it takes more tokens.")]
     public static async Task<string> GetContent(string pageId)
     {
         EnsureManager();
@@ -570,6 +570,33 @@ public static class PlaywrightTools
         _sources[pageId] = new ConcurrentDictionary<string, string>();
     }
 
+    [McpServerTool, Description("Get the Playwright accessibility snapshot (AX tree) (Prefer this to GetContent) for the page. Returns JSON representation of the accessibility tree. Set interestingOnly to true to filter to nodes Playwright considers interesting.")]
+    public static async Task<string> GetAccessibilitySnapshot(string pageId, bool interestingOnly = true)
+    {
+        EnsureManager();
+        if (string.IsNullOrWhiteSpace(pageId)) throw new ArgumentException("pageId is required", nameof(pageId));
+
+        var page = _manager!.GetPage(pageId);
+        if (page == null) throw new ArgumentException("Unknown pageId", nameof(pageId));
+
+        try
+        {
+            // Use locator-based aria snapshot (recommended replacement for page.Accessibility)
+            // Capture the aria snapshot for the document body. Playwright returns a YAML string.
+            var locator = page.Locator("body");
+            string ariaSnapshot = await locator.AriaSnapshotAsync();
+
+            var payload = new { ariaSnapshot };
+            var opts = new JsonSerializerOptions { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+            return JsonSerializer.Serialize(payload, opts);
+        }
+        catch (Exception ex)
+        {
+            var err = new { error = $"Could not retrieve accessibility snapshot: {ex.Message}" };
+            return JsonSerializer.Serialize(err, new JsonSerializerOptions { WriteIndented = false });
+        }
+    }
+
     [McpServerTool, Description("Clear all captured investigator data (console, network, sources) for a page.")]
     public static void ClearAllCapturedData(string pageId)
     {
@@ -579,6 +606,37 @@ public static class PlaywrightTools
         _networkOrder[pageId] = new ConcurrentQueue<string>();
         _sources[pageId] = new ConcurrentDictionary<string, string>();
         _contentPages[pageId] = new ConcurrentDictionary<int, string>();
+    }
+
+    [McpServerTool, Description("List known context ids as JSON array. Useful to discover other contexts created by the manager.")]
+    public static string ListContexts()
+    {
+        EnsureManager();
+        try
+        {
+            var contexts = _manager!.ListContexts();
+            return JsonSerializer.Serialize(contexts);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Could not list contexts: {ex.Message}", ex);
+        }
+    }
+
+    [McpServerTool, Description("List page ids for a given context as JSON array.")]
+    public static string ListPages(string contextId)
+    {
+        EnsureManager();
+        if (string.IsNullOrWhiteSpace(contextId)) throw new ArgumentException("contextId is required", nameof(contextId));
+        try
+        {
+            var pages = _manager!.ListPages(contextId);
+            return JsonSerializer.Serialize(pages);
+        }
+        catch (Exception ex)
+        {
+            throw new InvalidOperationException($"Could not list pages for context '{contextId}': {ex.Message}", ex);
+        }
     }
 
     private static void EnsureManager()

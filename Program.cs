@@ -26,7 +26,7 @@ for (int i = 0; i < args.Length; i++)
     }
 }
 
-// If user didn't provide a user data dir, use a permanent directory on the Desktop.
+// If user didn't provide a user data dir, use the playwright-user-data on the Desktop.
 if (string.IsNullOrWhiteSpace(userDataDir))
 {
     var desktopPath = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
