@@ -7,6 +7,9 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Playwright;
+using System.Runtime.CompilerServices;
+using DiffPlex.DiffBuilder;
+using DiffPlex.DiffBuilder.Model;
 
 [McpServerToolType]
 public static class PlaywrightTools
@@ -38,29 +41,39 @@ public static class PlaywrightTools
         return await _manager!.NewPageAsync(contextId);
     }
 
-    [McpServerTool, Description("Navigates the page to the specified url.")]
-    public static async Task Navigate(string pageId, string url)
+    [McpServerTool, Description("Injects a session token or cookie into the browser context. This allows you to simulate logged-in sessions by passing a cookie name, value, and domain (e.g., '.kuda.com').")]
+    public static async Task InjectCookie(string pageId, string name, string value, string domain, string path = "/")
     {
         EnsureManager();
-        if (string.IsNullOrWhiteSpace(pageId)) throw new ArgumentException("pageId is required", nameof(pageId));
-        if (string.IsNullOrWhiteSpace(url)) throw new ArgumentException("url is required", nameof(url));
+        var page = _manager!.GetPage(pageId);
+        await page.Context.AddCookiesAsync(new[]
+        {
+            new Microsoft.Playwright.Cookie
+            {
+                Name = name,
+                Value = value,
+                Domain = domain,
+                Path = path
+            }
+        });
+    }
+
+    [McpServerTool, Description("Navigates the page to the specified url.")]
+    public static async Task<string> Navigate(string pageId, string url)
+    {
+        EnsureManager();
+        if (string.IsNullOrWhiteSpace(pageId)) return "Error: pageId is required";
+        if (string.IsNullOrWhiteSpace(url)) return "Error: url is required";
 
         var page = _manager!.GetPage(pageId);
-        if (page == null) throw new ArgumentException("Unknown pageId", nameof(pageId));
+        if (page == null) return "Error: Unknown pageId";
 
-        // If the page is closed, surface a clear error
         try
         {
-            // IPage exposes IsClosed in Playwright .NET
-            if (page.IsClosed)
-                throw new InvalidOperationException("The requested page is already closed.");
+            if (page.IsClosed) return "Error: The requested page is already closed.";
         }
-        catch
-        {
-            // If introspection fails, continue and let GotoAsync report the error
-        }
+        catch { }
 
-        // Normalize/validate URL: if no scheme is provided, try http:// prefix
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != "file" && uri.Scheme != "about"))
         {
             if (Uri.TryCreate("http://" + url, UriKind.Absolute, out var tryUri))
@@ -69,43 +82,38 @@ public static class PlaywrightTools
             }
             else
             {
-                throw new ArgumentException($"Invalid URL: '{url}'", nameof(url));
+                return $"Error: Invalid URL: '{url}'";
             }
         }
 
-        // Try a few sensible navigation strategies when timeouts occur on slow or resource-heavy sites.
         try
         {
-            // Primary attempt: wait for network idle (most complete state) with a 30s timeout
             await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 30000 });
-            return;
+            return "Success";
         }
         catch (TimeoutException firstTimeout)
         {
-            // Fallback 1: wait for full load with a longer timeout (some pages take longer to load resources)
             try
             {
                 await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.Load, Timeout = 60000 });
-                return;
+                return "Success";
             }
             catch (TimeoutException secondTimeout)
             {
-                // Final fallback: navigate and return once navigation is committed (don't wait for network)
                 try
                 {
                     await page.GotoAsync(url, new PageGotoOptions { WaitUntil = WaitUntilState.Commit, Timeout = 15000 });
-                    return;
+                    return "Success";
                 }
                 catch (Exception finalEx)
                 {
-                    throw new InvalidOperationException($"Navigation to '{url}' failed after multiple attempts: first timeout={firstTimeout.Message}; second timeout={secondTimeout.Message}; final error={finalEx.Message}", finalEx);
+                    return $"Error: Navigation to '{url}' failed after multiple attempts: final error={finalEx.Message}";
                 }
             }
         }
         catch (Exception ex)
         {
-            // Non-timeout error: provide context
-            throw new InvalidOperationException($"Navigation to '{url}' failed: {ex.Message}", ex);
+            return $"Error: Navigation to '{url}' failed: {ex.Message}";
         }
     }
 
@@ -124,13 +132,13 @@ public static class PlaywrightTools
             return content;
         }
         // Return content truncated to chunk size limit for immediate response
-        _contentPages.TryRemove(pageId, out var _);
-        return content.Substring(0, Math.Min(content.Length, DefaultContentChunkSize));
+        //_contentPages.TryRemove(pageId, out var _);
+        //return content.Substring(0, Math.Min(content.Length, DefaultContentChunkSize));
 
         // Otherwise split into pages and store; return a small JSON metadata object pointing to pagination
-        //PrepareContentPages(pageId, content);
-        //var meta = new { paginated = true, pageCount = GetContentPageCount(pageId) };
-        //return JsonSerializer.Serialize(meta);
+        PrepareContentPages(pageId, content);
+        var meta = new { paginated = true, pageCount = GetContentPageCount(pageId) };
+        return JsonSerializer.Serialize(meta);
     }
 
     // Helper to split and store content into chunks (preserving UTF8 boundaries heuristically)
@@ -178,20 +186,198 @@ public static class PlaywrightTools
         return chunk;
     }
 
-    [McpServerTool, Description("Types text into selector on the page.")]
-    public static async Task Type(string pageId, string selector, string text)
+    [McpServerTool, Description("Clicks on a selector on the page.")]
+    public static async Task<string> Click(string pageId, string selector)
+    {
+        EnsureManager();
+        try 
+        {
+            var page = _manager!.GetPage(pageId);
+            await page.ClickAsync(selector);
+            return "Success";
+        } 
+        catch (Exception ex) 
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Hovers over a selector on the page. Implicitly scrolls the element into view before hovering.")]
+    public static async Task<string> Hover(string pageId, string selector)
+    {
+        EnsureManager();
+        try 
+        {
+            var page = _manager!.GetPage(pageId);
+            var locator = page.Locator(selector);
+            await locator.ScrollIntoViewIfNeededAsync();
+            await locator.HoverAsync();
+            return "Success";
+        } 
+        catch (Exception ex) 
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Drags the element at sourceSelector and drops it onto the targetSelector. Implicitly scrolls the elements into view.")]
+    public static async Task<string> DragAndDrop(string pageId, string sourceSelector, string targetSelector)
+    {
+        EnsureManager();
+        try 
+        {
+            var page = _manager!.GetPage(pageId);
+            var source = page.Locator(sourceSelector);
+            var target = page.Locator(targetSelector);
+            
+            await source.ScrollIntoViewIfNeededAsync();
+            
+            await source.DragToAsync(target);
+            
+            await target.ScrollIntoViewIfNeededAsync();
+            return "Success";
+        } 
+        catch (Exception ex) 
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    public class TypeOptions
+    {
+        public bool PressEnter { get; set; }
+        public float? Delay { get; set; }
+    }
+
+    [McpServerTool, Description("Types text into selector on the page, simulating real keyboard events. You can provide an options argument like {\"pressEnter\": true, \"delay\": 100} to press Enter after typing or add a typing delay in milliseconds.")]
+    public static async Task<string> Type(string pageId, string selector, string text, TypeOptions? options = null)
+    {
+        EnsureManager();
+        try 
+        {
+            var page = _manager!.GetPage(pageId);
+            var locator = page.Locator(selector);
+            await locator.ClearAsync();
+
+            var seqOptions = new LocatorPressSequentiallyOptions();
+            if (options?.Delay != null)
+            {
+                seqOptions.Delay = options.Delay;
+            }
+
+            await locator.PressSequentiallyAsync(text, seqOptions);
+            if (options?.PressEnter == true)
+            {
+                await locator.PressAsync("Enter");
+            }
+            return "Success";
+        } 
+        catch (Exception ex) 
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Executes arbitrary JavaScript in the browser page and returns the result as a JSON string. Use this to run batched logic locally without multiple round trips.")]
+    public static async Task<string> EvaluateScript(string pageId, string script)
     {
         EnsureManager();
         var page = _manager!.GetPage(pageId);
-        await page.FillAsync(selector, text);
+        try 
+        {
+            var result = await page.EvaluateAsync<object>(script);
+            return JsonSerializer.Serialize(result);
+        }
+        catch(Exception ex)
+        {
+            return JsonSerializer.Serialize(new { error = ex.Message });
+        }
     }
 
-    [McpServerTool, Description("Takes a screenshot of the page and returns a base64-encoded PNG.")]
+    [McpServerTool, Description("Takes a screenshot of the page and returns a base64-encoded PNG. Use GetAccessibilitySnapshot instead. Do not call this unless necessary as it takes more tokens.")]
     public static async Task<string> Screenshot(string pageId)
     {
         EnsureManager();
-        var bytes = await _manager!.ScreenshotAsync(pageId);
-        return Convert.ToBase64String(bytes);
+        try
+        {
+            var bytes = await _manager!.ScreenshotAsync(pageId);
+            return Convert.ToBase64String(bytes);
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Takes a screenshot of a specific element region by selector and returns a base64-encoded PNG. This is much more token-efficient than a full page screenshot.")]
+    public static async Task<string> ScreenshotRegion(string pageId, string selector)
+    {
+        EnsureManager();
+        var page = _manager!.GetPage(pageId);
+        var locator = page.Locator(selector);
+        try
+        {
+            // Force scroll to trigger lazy loading and calculate actual dimensions before screenshotting
+            await locator.ScrollIntoViewIfNeededAsync(new LocatorScrollIntoViewIfNeededOptions { Timeout = 10000 });
+            var bytes = await locator.ScreenshotAsync(new LocatorScreenshotOptions { Timeout = 15000 });
+            return Convert.ToBase64String(bytes);
+        }
+        catch (System.TimeoutException)
+        {
+            return $"Error: Screenshot failed: Timed out waiting for selector '{selector}' to become visible. Ensure it is rendered and not obscured.";
+        }
+        catch (System.Exception ex)
+        {
+            return $"Error: Screenshot failed for selector '{selector}'. The element might be hidden, 0x0 size, or missing entirely. Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Waits for a specific selector to appear on the page. Timeout is in milliseconds (default is 30000).")]
+    public static async Task<string> WaitForSelector(string pageId, string selector, float? timeout = null)
+    {
+        EnsureManager();
+        var page = _manager!.GetPage(pageId);
+        var options = new PageWaitForSelectorOptions();
+        if (timeout.HasValue) options.Timeout = timeout.Value;
+        
+        try
+        {
+            await page.WaitForSelectorAsync(selector, options);
+            return "Success";
+        }
+        catch (System.TimeoutException)
+        {
+            float actualTimeout = timeout ?? 30000f;
+            return $"Error: Selector '{selector}' timed out after {actualTimeout}ms. Ensure the selector is correct or the page has fully loaded.";
+        }
+        catch (System.Exception ex)
+        {
+            return $"Error: Failed waiting for selector '{selector}': {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Waits for the page to reach a specific load state: 'load', 'domcontentloaded', or 'networkidle' (default 'load'). Timeout is in milliseconds.")]
+    public static async Task<string> WaitForLoadState(string pageId, string state = "load", float? timeout = null)
+    {
+        EnsureManager();
+        try 
+        {
+            var page = _manager!.GetPage(pageId);
+            var loadState = state.ToLowerInvariant() switch
+            {
+                "domcontentloaded" => LoadState.DOMContentLoaded,
+                "networkidle" => LoadState.NetworkIdle,
+                _ => LoadState.Load
+            };
+            var options = new PageWaitForLoadStateOptions();
+            if (timeout.HasValue) options.Timeout = timeout.Value;
+            await page.WaitForLoadStateAsync(loadState, options);
+            return "Success";
+        } 
+        catch (Exception ex) 
+        {
+            return $"Error: {ex.Message}";
+        }
     }
 
     // --- Investigator-style capture tools ---
@@ -201,12 +387,14 @@ public static class PlaywrightTools
     // Chunked HTML/content storage: pageId -> (pageIndex -> chunk)
     private const int DefaultContentChunkSize = 512 * 2 * 1024; // 512 * 2 KB per chunk
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<int, string>> _contentPages = new();
+    // DOM Diffing state
+    private static readonly ConcurrentDictionary<string, string> _lastAriaSnapshots = new();
     // Network transactions: pageId -> (transactionId -> transaction)
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, NetworkTransaction>> _networkTransactions = new();
     // Preserve order of transaction ids per page
     private static readonly ConcurrentDictionary<string, ConcurrentQueue<string>> _networkOrder = new();
     // map request object to transaction id for pairing
-    private static readonly ConcurrentDictionary<object, string> _requestToTransactionId = new();
+    private static readonly ConditionalWeakTable<object, string> _requestToTransactionId = new();
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, string>> _sources = new(); // pageId -> (url -> base64)
 
     // Keep event handler references so we can unsubscribe
@@ -220,10 +408,13 @@ public static class PlaywrightTools
         public string Id { get; set; } = string.Empty;
         public string Url { get; set; } = string.Empty;
         public string Method { get; set; } = string.Empty;
+        public string ResourceType { get; set; } = string.Empty;
         public int? Status { get; set; }
         public string? StatusText { get; set; }
         public long RequestTimestamp { get; set; }
         public long? ResponseTimestamp { get; set; }
+        public string? RedirectedFromId { get; set; }
+        public string? RedirectedToId { get; set; }
     }
 
     private class NetworkTransaction
@@ -232,6 +423,7 @@ public static class PlaywrightTools
         // request side
         public string Url { get; set; } = string.Empty;
         public string Method { get; set; } = string.Empty;
+        public string ResourceType { get; set; } = string.Empty;
         public Dictionary<string, string>? RequestHeaders { get; set; }
         public string? RequestBodyBase64 { get; set; }
         public long RequestTimestamp { get; set; }
@@ -241,6 +433,8 @@ public static class PlaywrightTools
         public Dictionary<string, string>? ResponseHeaders { get; set; }
         public string? ResponseBodyBase64 { get; set; }
         public long? ResponseTimestamp { get; set; }
+        public string? RedirectedFromId { get; set; }
+        public string? RedirectedToId { get; set; }
     }
 
     [McpServerTool, Description("Start capturing console messages for the given page.")]
@@ -340,14 +534,31 @@ public static class PlaywrightTools
 
             // create a transaction and store request metadata
             var id = Guid.NewGuid().ToString();
+            string? redirectedFromTxId = null;
+            if (req.RedirectedFrom != null)
+            {
+                _requestToTransactionId.TryGetValue(req.RedirectedFrom, out redirectedFromTxId);
+            }
+
             var tx = new NetworkTransaction
             {
                 Id = id,
                 Url = req.Url,
                 Method = req.Method,
+                ResourceType = req.ResourceType,
                 RequestBodyBase64 = bodyB64,
-                RequestTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                RequestTimestamp = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                RedirectedFromId = redirectedFromTxId
             };
+
+            if (redirectedFromTxId != null)
+            {
+                _networkTransactions.TryGetValue(pageId, out var pMap);
+                if (pMap != null && pMap.TryGetValue(redirectedFromTxId, out var parentTx))
+                {
+                    parentTx.RedirectedToId = id;
+                }
+            }
 
             // try to capture headers
             try
@@ -386,7 +597,7 @@ public static class PlaywrightTools
             orderQ.Enqueue(id);
 
             // keep map from request object to transaction id for pairing on response
-            try { _requestToTransactionId[req] = id; } catch { }
+            try { _requestToTransactionId.AddOrUpdate(req, id); } catch { }
 
             // If body captured, store as a source (use a pseudo-url key to avoid overwriting real responses)
             if (bodyB64 != null)
@@ -500,27 +711,53 @@ public static class PlaywrightTools
         if (_responseHandlers.TryRemove(pageId, out var s)) page.Response -= s;
     }
 
-    [McpServerTool, Description("List captured network transactions (summaries) for the page as JSON array.")]
-    public static string ListNetworkTransactions(string pageId)
+    [McpServerTool, Description("List captured network transactions (summaries) for the page as JSON array. Filter options: 'xhr_only', 'errors_only', or null for all. Set excludeStaticAssets=false to include images/fonts/css. Use domainFilter (e.g. 'api.kuda.com') to constrain results.")]
+    public static string ListNetworkTransactions(string pageId, string? filter = null, bool excludeStaticAssets = true, string? domainFilter = null)
     {
         EnsureManager();
         if (!_networkTransactions.TryGetValue(pageId, out var map)) return "[]";
         _networkOrder.TryGetValue(pageId, out var orderQ);
         var ids = orderQ?.ToArray() ?? map.Keys.ToArray();
         var summaries = new List<NetworkSummary>();
+        
+        var normalizedFilter = filter?.ToLowerInvariant();
+
         foreach (var id in ids)
         {
             if (map.TryGetValue(id, out var tx))
             {
+                var isAjax = string.Equals(tx.ResourceType, "xhr", StringComparison.OrdinalIgnoreCase) || 
+                             string.Equals(tx.ResourceType, "fetch", StringComparison.OrdinalIgnoreCase);
+
+                if (normalizedFilter == "xhr_only" && !isAjax) continue;
+                if (normalizedFilter == "errors_only" && (tx.Status == null || tx.Status < 400)) continue;
+
+                if (excludeStaticAssets)
+                {
+                    bool isStatic = string.Equals(tx.ResourceType, "image", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(tx.ResourceType, "stylesheet", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(tx.ResourceType, "font", StringComparison.OrdinalIgnoreCase) ||
+                                    string.Equals(tx.ResourceType, "media", StringComparison.OrdinalIgnoreCase);
+                    if (isStatic) continue;
+                }
+
+                if (!string.IsNullOrWhiteSpace(domainFilter))
+                {
+                    if (tx.Url == null || !tx.Url.Contains(domainFilter, StringComparison.OrdinalIgnoreCase)) continue;
+                }
+
                 summaries.Add(new NetworkSummary
                 {
                     Id = id,
                     Url = tx.Url,
                     Method = tx.Method,
+                    ResourceType = tx.ResourceType,
                     Status = tx.Status,
                     StatusText = tx.StatusText,
                     RequestTimestamp = tx.RequestTimestamp,
-                    ResponseTimestamp = tx.ResponseTimestamp
+                    ResponseTimestamp = tx.ResponseTimestamp,
+                    RedirectedFromId = tx.RedirectedFromId,
+                    RedirectedToId = tx.RedirectedToId
                 });
             }
         }
@@ -570,7 +807,7 @@ public static class PlaywrightTools
         _sources[pageId] = new ConcurrentDictionary<string, string>();
     }
 
-    [McpServerTool, Description("Get the Playwright accessibility snapshot (AX tree) (Prefer this to GetContent) for the page. Returns JSON representation of the accessibility tree. Set interestingOnly to true to filter to nodes Playwright considers interesting.")]
+    [McpServerTool, Description("Get the Playwright accessibility snapshot (AX tree) (Prefer this to GetContent or screenshot) for the page. Returns JSON representation of the accessibility tree. Set interestingOnly to true to filter to nodes Playwright considers interesting.")]
     public static async Task<string> GetAccessibilitySnapshot(string pageId, bool interestingOnly = true)
     {
         EnsureManager();
@@ -586,6 +823,8 @@ public static class PlaywrightTools
             var locator = page.Locator("body");
             string ariaSnapshot = await locator.AriaSnapshotAsync();
 
+            _lastAriaSnapshots[pageId] = ariaSnapshot;
+
             var payload = new { ariaSnapshot };
             var opts = new JsonSerializerOptions { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
             return JsonSerializer.Serialize(payload, opts);
@@ -594,6 +833,72 @@ public static class PlaywrightTools
         {
             var err = new { error = $"Could not retrieve accessibility snapshot: {ex.Message}" };
             return JsonSerializer.Serialize(err, new JsonSerializerOptions { WriteIndented = false });
+        }
+    }
+
+    [McpServerTool, Description("Get a unified diff of the Accessibility Snapshot since the last time this tool or GetAccessibilitySnapshot was called. Set resetBaseline to true to clear any old state and just return the full raw snapshot.")]
+    public static async Task<string> GetAccessibilityDiff(string pageId, bool resetBaseline = false)
+    {
+        EnsureManager();
+        if (string.IsNullOrWhiteSpace(pageId)) return "Error: pageId is required";
+
+        var page = _manager!.GetPage(pageId);
+        if (page == null) return "Error: Unknown pageId";
+
+        try
+        {
+            var locator = page.Locator("body");
+            string newSnapshot = await locator.AriaSnapshotAsync();
+
+            string? oldSnapshot = null;
+            if (!resetBaseline && _lastAriaSnapshots.TryGetValue(pageId, out var existing))
+            {
+                oldSnapshot = existing;
+            }
+
+            _lastAriaSnapshots[pageId] = newSnapshot;
+
+            if (string.IsNullOrEmpty(oldSnapshot))
+            {
+                var payload = new { status = "Initial State (No baseline to diff against)", diff = newSnapshot };
+                var opts = new JsonSerializerOptions { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+                return JsonSerializer.Serialize(payload, opts);
+            }
+
+            var diff = InlineDiffBuilder.Diff(oldSnapshot, newSnapshot);
+            var sb = new StringBuilder();
+            bool hasChanges = false;
+            foreach (var line in diff.Lines)
+            {
+                if (line.Type == ChangeType.Inserted) 
+                {
+                    sb.AppendLine($"+ {line.Text}");
+                    hasChanges = true;
+                }
+                else if (line.Type == ChangeType.Deleted) 
+                {
+                    sb.AppendLine($"- {line.Text}");
+                    hasChanges = true;
+                }
+                else if (line.Type == ChangeType.Unchanged) 
+                {
+                    sb.AppendLine($"  {line.Text}");
+                }
+            }
+
+            if (!hasChanges)
+            {
+                var payload = new { status = "No DOM/Accessibility changes detected since last call.", diff = "" };
+                var opts = new JsonSerializerOptions { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+                return JsonSerializer.Serialize(payload, opts);
+            }
+
+            var resultPayload = new { status = "Differences found.", diff = sb.ToString() };
+            return JsonSerializer.Serialize(resultPayload, new JsonSerializerOptions { WriteIndented = false });
+        }
+        catch (Exception ex)
+        {
+            return $"Error: Could not retrieve or compute accessibility diff: {ex.Message}";
         }
     }
 
@@ -606,6 +911,7 @@ public static class PlaywrightTools
         _networkOrder[pageId] = new ConcurrentQueue<string>();
         _sources[pageId] = new ConcurrentDictionary<string, string>();
         _contentPages[pageId] = new ConcurrentDictionary<int, string>();
+        _lastAriaSnapshots.TryRemove(pageId, out _);
     }
 
     [McpServerTool, Description("List known context ids as JSON array. Useful to discover other contexts created by the manager.")]
@@ -636,6 +942,161 @@ public static class PlaywrightTools
         catch (Exception ex)
         {
             throw new InvalidOperationException($"Could not list pages for context '{contextId}': {ex.Message}", ex);
+        }
+    }
+
+    [McpServerTool, Description("Traces the redirect chain forwards and backwards for a given network transaction ID, returning the ordered lineage of requests.")]
+    public static string TraceRedirectChain(string pageId, string transactionId)
+    {
+        EnsureManager();
+        if (!_networkTransactions.TryGetValue(pageId, out var map)) return "[]";
+        
+        if (!map.TryGetValue(transactionId, out var tx)) return $"Error: Transaction {transactionId} not found.";
+
+        var chain = new List<NetworkTransaction>();
+        var curr = tx;
+        while (curr.RedirectedFromId != null && map.TryGetValue(curr.RedirectedFromId, out var prev))
+        {
+            chain.Insert(0, prev);
+            curr = prev;
+        }
+
+        chain.Add(tx);
+
+        curr = tx;
+        while (curr.RedirectedToId != null && map.TryGetValue(curr.RedirectedToId, out var next))
+        {
+            chain.Add(next);
+            curr = next;
+        }
+
+        var opts = new JsonSerializerOptions { WriteIndented = false, DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull };
+        return JsonSerializer.Serialize(chain, opts);
+    }
+
+    [McpServerTool, Description("Intercept network requests matching a URL pattern. You can abort, or inject mock JSON responses, or override headers/POST data securely. It will remain active until you call ClearInterceptions.")]
+    public static async Task<string> InterceptAndModify(
+        string pageId, 
+        string urlPattern, 
+        string? mockJsonResponse = null, 
+        int? mockStatus = null, 
+        Dictionary<string, string>? overrideHeaders = null, 
+        string? overridePostData = null,
+        bool abortRequest = false)
+    {
+        EnsureManager();
+        var page = _manager!.GetPage(pageId);
+        try 
+        {
+            await page.RouteAsync(urlPattern, async route => 
+            {
+                if (abortRequest) 
+                {
+                    await route.AbortAsync();
+                    return;
+                }
+                
+                if (mockJsonResponse != null)
+                {
+                    var opts = new RouteFulfillOptions { 
+                        Status = mockStatus ?? 200, 
+                        Body = mockJsonResponse, 
+                        ContentType = "application/json" 
+                    };
+                    await route.FulfillAsync(opts);
+                    return;
+                }
+
+                var continueOpts = new RouteContinueOptions();
+                if (overrideHeaders != null) continueOpts.Headers = overrideHeaders;
+                if (overridePostData != null) continueOpts.PostData = Encoding.UTF8.GetBytes(overridePostData);
+
+                await route.ContinueAsync(continueOpts);
+            });
+            return $"Success: Interceptor activated for '{urlPattern}'.";
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Clears all active network interceptions on the page.")]
+    public static async Task<string> ClearInterceptions(string pageId)
+    {
+        EnsureManager();
+        var page = _manager!.GetPage(pageId);
+        try
+        {
+            await page.UnrouteAllAsync();
+            return "Success: All network interceptions cleared.";
+        }
+        catch(Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Intercept network requests matching a URL pattern globally across the ENTIRE context. Applies to all pages. You can abort, inject mock JSON, or override headers/POST data.")]
+    public static async Task<string> InterceptContextAndModify(
+        string contextId, 
+        string urlPattern, 
+        string? mockJsonResponse = null, 
+        int? mockStatus = null, 
+        Dictionary<string, string>? overrideHeaders = null, 
+        string? overridePostData = null,
+        bool abortRequest = false)
+    {
+        EnsureManager();
+        var context = _manager!.GetContext(contextId);
+        try 
+        {
+            await context.RouteAsync(urlPattern, async route => 
+            {
+                if (abortRequest) 
+                {
+                    await route.AbortAsync();
+                    return;
+                }
+                
+                if (mockJsonResponse != null)
+                {
+                    var opts = new RouteFulfillOptions { 
+                        Status = mockStatus ?? 200, 
+                        Body = mockJsonResponse, 
+                        ContentType = "application/json" 
+                    };
+                    await route.FulfillAsync(opts);
+                    return;
+                }
+
+                var continueOpts = new RouteContinueOptions();
+                if (overrideHeaders != null) continueOpts.Headers = overrideHeaders;
+                if (overridePostData != null) continueOpts.PostData = Encoding.UTF8.GetBytes(overridePostData);
+
+                await route.ContinueAsync(continueOpts);
+            });
+            return $"Success: Global Context Interceptor activated for '{urlPattern}'.";
+        }
+        catch (Exception ex)
+        {
+            return $"Error: {ex.Message}";
+        }
+    }
+
+    [McpServerTool, Description("Clears all active network interceptions across the entire context.")]
+    public static async Task<string> ClearContextInterceptions(string contextId)
+    {
+        EnsureManager();
+        var context = _manager!.GetContext(contextId);
+        try
+        {
+            await context.UnrouteAllAsync();
+            return "Success: All context-wide network interceptions cleared.";
+        }
+        catch(Exception ex)
+        {
+            return $"Error: {ex.Message}";
         }
     }
 

@@ -115,6 +115,13 @@ public sealed class PlaywrightManager : IAsyncDisposable
         return page;
     }
 
+    public IBrowserContext GetContext(string contextId)
+    {
+        if (!_contexts.TryGetValue(contextId, out var context))
+            throw new ArgumentException("Unknown contextId");
+        return context;
+    }
+
     public async Task<byte[]> ScreenshotAsync(string pageId, PageScreenshotOptions? options = null)
     {
         var page = GetPage(pageId);
