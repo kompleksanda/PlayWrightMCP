@@ -47,9 +47,9 @@ builder.Logging.AddConsole(consoleLogOptions =>
     consoleLogOptions.LogToStandardErrorThreshold = LogLevel.Trace;
 });
 // Add file logger that writes to a file on the user's Desktop and overwrites it each run.
-var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
-var logPath = Path.Combine(desktop, "PlayWright.log");
-builder.Logging.AddProvider(new FileLoggerProvider(logPath, LogLevel.Trace));
+//var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+//var logPath = Path.Combine(desktop, "PlayWright.log");
+//builder.Logging.AddProvider(new FileLoggerProvider(logPath, LogLevel.Trace));
 builder.Services
     .AddMcpServer()
     .WithStdioServerTransport()

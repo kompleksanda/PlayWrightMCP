@@ -20,6 +20,34 @@ public static class PlaywrightTools
     public static void SetManager(PlaywrightManager manager) => _manager = manager;
 
     // --- existing basic helpers ---
+    private static CdpRelayServer? _relayServer;
+
+    [McpServerTool, Description("Connects to a running Playwright MCP Bridge browser extension. Spawns Chrome automatically. Returns the browserId, contextId and list of pages discovered.")]
+    public static async Task<object> ConnectToExtensionBridge(string? token = null)
+    {
+        EnsureManager();
+        try
+        {
+            token ??= Environment.GetEnvironmentVariable("PLAYWRIGHT_MCP_EXTENSION_TOKEN") ?? "";
+            
+            if (_relayServer != null)
+            {
+                _relayServer.Dispose();
+            }
+            _relayServer = new CdpRelayServer();
+            
+            // Starts server and spawns browser process, blocks until connected
+            await _relayServer.StartAndConnectAsync(token);
+            
+            // Re-route internal Playwright connecting to that relay CDP endpoint
+            return await _manager!.ConnectBrowserAsync(_relayServer.CdpEndpoint);
+        }
+        catch (Exception ex)
+        {
+            return new { error = ex.Message };
+        }
+    }
+
     [McpServerTool, Description("Launches a Chromium browser and returns a browserId. You should only call this once and reuse the browserId for multiple contexts/pages. Call the new context tool next.")]
     public static async Task<string> LaunchBrowser(bool headless = true)
     {
@@ -807,8 +835,8 @@ public static class PlaywrightTools
         _sources[pageId] = new ConcurrentDictionary<string, string>();
     }
 
-    [McpServerTool, Description("Get the Playwright accessibility snapshot (AX tree) (Prefer this to GetContent or screenshot) for the page. Returns JSON representation of the accessibility tree. Set interestingOnly to true to filter to nodes Playwright considers interesting.")]
-    public static async Task<string> GetAccessibilitySnapshot(string pageId, bool interestingOnly = true)
+    [McpServerTool, Description("Get the Playwright accessibility snapshot (Aria Snapshot) for the page. Returns a YAML string representation. Use this to understand page structure and element roles. Always use GetAccessibilitySnapshotDiff instead of this to detect changes in the DOM and save context")]
+    public static async Task<string> GetAccessibilitySnapshot(string pageId)
     {
         EnsureManager();
         if (string.IsNullOrWhiteSpace(pageId)) throw new ArgumentException("pageId is required", nameof(pageId));
@@ -818,10 +846,9 @@ public static class PlaywrightTools
 
         try
         {
-            // Use locator-based aria snapshot (recommended replacement for page.Accessibility)
-            // Capture the aria snapshot for the document body. Playwright returns a YAML string.
-            var locator = page.Locator("body");
-            string ariaSnapshot = await locator.AriaSnapshotAsync();
+            // Use locator-based aria snapshot on the html element to get the full page.
+            // This is equivalent to the page-level snapshot but avoids SDK version mismatch issues.
+            string ariaSnapshot = await page.Locator("html").AriaSnapshotAsync();
 
             _lastAriaSnapshots[pageId] = ariaSnapshot;
 
@@ -831,13 +858,12 @@ public static class PlaywrightTools
         }
         catch (Exception ex)
         {
-            var err = new { error = $"Could not retrieve accessibility snapshot: {ex.Message}" };
-            return JsonSerializer.Serialize(err, new JsonSerializerOptions { WriteIndented = false });
+            return JsonSerializer.Serialize(new { error = $"Accessibility Timeout or Error: {ex.Message}" });
         }
     }
 
-    [McpServerTool, Description("Get a unified diff of the Accessibility Snapshot since the last time this tool or GetAccessibilitySnapshot was called. Set resetBaseline to true to clear any old state and just return the full raw snapshot.")]
-    public static async Task<string> GetAccessibilityDiff(string pageId, bool resetBaseline = false)
+    [McpServerTool, Description("Get a unified diff of the Accessibility Snapshot since the last time this tool or GetAccessibilitySnapshot was called. Set resetBaseline to true to clear any old state and just return the full raw snapshot. Use this instead of GetAccessibilitySnapshot to detect changes in the DOM and save context")]
+    public static async Task<string> GetAccessibilitySnapshotDiff(string pageId, bool resetBaseline = false)
     {
         EnsureManager();
         if (string.IsNullOrWhiteSpace(pageId)) return "Error: pageId is required";

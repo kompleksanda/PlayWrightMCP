@@ -1,7 +1,12 @@
 using Microsoft.Playwright;
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Threading.Tasks;
+
+public record ConnectionPageInfo(string PageId, string Title, string Url);
+public record ConnectionContextInfo(string ContextId, List<ConnectionPageInfo> Pages);
+public record ConnectionResult(string BrowserId, List<ConnectionContextInfo> Contexts);
 
 public sealed class PlaywrightManager : IAsyncDisposable
 {
@@ -37,6 +42,40 @@ public sealed class PlaywrightManager : IAsyncDisposable
     {
         var pw = await Playwright.CreateAsync();
         return new PlaywrightManager(pw, options);
+    }
+
+    public async Task<ConnectionResult> ConnectBrowserAsync(string endpointUrl)
+    {
+        var browser = await _chromium.ConnectOverCDPAsync(endpointUrl);
+        var id = Guid.NewGuid().ToString();
+        _browsers[id] = browser;
+
+        var resultContexts = new List<ConnectionContextInfo>();
+
+        foreach (var ctx in browser.Contexts)
+        {
+            var ctxId = Guid.NewGuid().ToString();
+            _contexts[ctxId] = ctx;
+
+            _persistentBrowserToContext[id] = ctxId;
+
+            var resultPages = new List<ConnectionPageInfo>();
+
+            foreach (var page in ctx.Pages)
+            {
+                var pageId = Guid.NewGuid().ToString();
+                _pages[pageId] = page;
+                _pageToContext[pageId] = ctxId;
+                var map = _contextToPages.GetOrAdd(ctxId, _ => new System.Collections.Concurrent.ConcurrentDictionary<string, byte>());
+                map.TryAdd(pageId, 0);
+
+                resultPages.Add(new ConnectionPageInfo(pageId, await page.TitleAsync(), page.Url));
+            }
+
+            resultContexts.Add(new ConnectionContextInfo(ctxId, resultPages));
+        }
+        
+        return new ConnectionResult(id, resultContexts);
     }
 
     public async Task<string> LaunchBrowserAsync(bool headless = true)
