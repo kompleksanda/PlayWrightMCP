@@ -59,6 +59,16 @@ public sealed class PlaywrightManager : IAsyncDisposable
 
             _persistentBrowserToContext[id] = ctxId;
 
+            // If no pages yet, wait a moment for the initial page
+            if (ctx.Pages.Count == 0)
+            {
+                var tcs = new TaskCompletionSource<IPage>(TaskCreationOptions.RunContinuationsAsynchronously);
+                void OnPage(object? s, IPage p) => tcs.TrySetResult(p);
+                ctx.Page += OnPage;
+                await Task.WhenAny(tcs.Task, Task.Delay(3000));
+                ctx.Page -= OnPage;
+            }
+
             var resultPages = new List<ConnectionPageInfo>();
 
             foreach (var page in ctx.Pages)
@@ -69,7 +79,15 @@ public sealed class PlaywrightManager : IAsyncDisposable
                 var map = _contextToPages.GetOrAdd(ctxId, _ => new System.Collections.Concurrent.ConcurrentDictionary<string, byte>());
                 map.TryAdd(pageId, 0);
 
-                resultPages.Add(new ConnectionPageInfo(pageId, await page.TitleAsync(), page.Url));
+                string title = page.Url;
+                try
+                {
+                    var titleTask = page.TitleAsync();
+                    title = await Task.WhenAny(titleTask, Task.Delay(1500)) == titleTask ? await titleTask : page.Url;
+                }
+                catch { }
+
+                resultPages.Add(new ConnectionPageInfo(pageId, title, page.Url));
             }
 
             resultContexts.Add(new ConnectionContextInfo(ctxId, resultPages));

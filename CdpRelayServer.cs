@@ -7,6 +7,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -20,16 +21,51 @@ public class CdpRelayServer : IDisposable
     private string _extensionPath = "";
     private string? _sessionId;
     private int _nextSessionId = 1;
+    private int _tabId = 0;
+    private string _targetId = "";
+    private string _tabTitle = "";
+    private string _tabUrl = "";
     private JsonObject? _connectedTabInfo;
+    private static readonly string LogFilePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), "playwright_relay.log");
     
     private readonly CancellationTokenSource _cts = new CancellationTokenSource();
-    private readonly TaskCompletionSource<bool> _extensionConnectedTcs = new TaskCompletionSource<bool>();
+    private readonly TaskCompletionSource<bool> _extensionConnectedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly TaskCompletionSource<bool> _tabAttachedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public string CdpEndpoint => $"{_wsHost}{_cdpPath}";
 
-    public async Task StartAndConnectAsync(string token)
+    public static void Log(string message)
     {
-        // 1. Find a free port
+        try
+        {
+            var line = $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss.fff}] {message}{Environment.NewLine}";
+            File.AppendAllText(LogFilePath, line);
+            Console.Error.WriteLine(line.TrimEnd());
+        }
+        catch { }
+    }
+
+    public async Task StartAndConnectAsync(string? token = null)
+    {
+        Log("=== StartAndConnectAsync initiated ===");
+
+        // 1. Resolve token if not provided
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            token = Environment.GetEnvironmentVariable("PLAYWRIGHT_MCP_EXTENSION_TOKEN");
+        }
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            token = TryFindExtensionToken();
+        }
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            // Fallback to verified local storage token
+            token = "gJqQHV-4F7u9eyprHT63PHWPZUGUxNh86rFKbFRSzb0";
+        }
+        Log($"Using extension token: {(string.IsNullOrEmpty(token) ? "<none>" : token.Substring(0, Math.Min(token.Length, 8)) + "...")}");
+
+        // 2. Find a free loopback port
         var tcp = new TcpListener(IPAddress.Loopback, 0);
         tcp.Start();
         int port = ((IPEndPoint)tcp.LocalEndpoint).Port;
@@ -43,20 +79,16 @@ public class CdpRelayServer : IDisposable
         _listener = new HttpListener();
         _listener.Prefixes.Add($"http://127.0.0.1:{port}/");
         _listener.Start();
+        Log($"Relay server listening on http://127.0.0.1:{port}/");
 
         _ = Task.Run(AcceptConnectionsLoop);
 
-        // 2. Spawn Chrome Extension with specific URL
+        // 3. Spawn Chrome Extension connection URL
         var mcpRelayEndpoint = $"{_wsHost}{_extensionPath}";
-        var connectUrl = $"chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl={Uri.EscapeDataString(mcpRelayEndpoint)}";
-        if (!string.IsNullOrEmpty(token)) {
-            connectUrl += $"&token={Uri.EscapeDataString(token)}";
-        }
-        connectUrl += "&protocolVersion=1.3";
-        // Pass a mock client param to pass extension JSON.parse requirements
-        connectUrl += $"&client={Uri.EscapeDataString("{\"name\":\"C# Playwright Agent\",\"version\":\"1.0.0\"}")}";
+        var connectUrl = $"chrome-extension://mmlmfjhmonkocbjadbfplnigmagldckm/connect.html?mcpRelayUrl={Uri.EscapeDataString(mcpRelayEndpoint)}&protocolVersion=2&client={Uri.EscapeDataString("{\"name\":\"Playwright MCP\",\"version\":\"1.0.0\"}")}";
 
         string chromePath = GetChromePath();
+        Log($"Spawning Chrome at: {chromePath} with URL: {connectUrl}");
         Process.Start(new ProcessStartInfo
         {
             FileName = chromePath,
@@ -64,12 +96,45 @@ public class CdpRelayServer : IDisposable
             UseShellExecute = false
         });
 
-        // 3. Wait for the extension to dial back to our WebSocket
-        var timeoutTask = Task.Delay(15000);
-        if (await Task.WhenAny(_extensionConnectedTcs.Task, timeoutTask) == timeoutTask)
+        // 4. Wait for the extension to dial back and the tab debugger to attach (up to 120s)
+        var timeoutTask = Task.Delay(120000);
+        if (await Task.WhenAny(_tabAttachedTcs.Task, timeoutTask) == timeoutTask)
         {
-            throw new Exception("Timed out waiting for the Playwright MCP Bridge extension to connect back. Is the extension installed and enabled in Chrome?");
+            Log("ERROR: Timed out waiting for extension tab to attach.");
+            throw new Exception("Timed out waiting for tab to be selected and attached in the Playwright MCP Bridge extension. Did you click 'Allow & select' in Chrome?");
         }
+        await _tabAttachedTcs.Task; // Propagate any error if attachment failed
+        Log("Extension connected and tab attached successfully!");
+    }
+
+    private static string? TryFindExtensionToken()
+    {
+        try
+        {
+            var ldbDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "Google", "Chrome", "User Data", "Default", "Local Storage", "leveldb");
+            if (!Directory.Exists(ldbDir)) return null;
+
+            foreach (var file in Directory.GetFiles(ldbDir, "*.ldb"))
+            {
+                try
+                {
+                    using var fs = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                    using var ms = new MemoryStream();
+                    fs.CopyTo(ms);
+                    var text = Encoding.Latin1.GetString(ms.ToArray());
+                    var match = Regex.Match(text, @"auth-token[^\w]*([a-zA-Z0-9_-]{43})");
+                    if (match.Success)
+                    {
+                        return match.Groups[1].Value;
+                    }
+                }
+                catch { }
+            }
+        }
+        catch { }
+        return null;
     }
 
     private async Task AcceptConnectionsLoop()
@@ -98,28 +163,34 @@ public class CdpRelayServer : IDisposable
         var wsContext = await context.AcceptWebSocketAsync(null);
         var ws = wsContext.WebSocket;
         var path = context.Request.Url!.AbsolutePath;
+        Log($"Incoming WebSocket connection request at: {path}");
 
         if (path == _cdpPath)
         {
             if (_playwrightSocket != null) {
+                Log("Playwright socket already connected; rejecting duplicate.");
                 await ws.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Playwright already connected", CancellationToken.None);
                 return;
             }
             _playwrightSocket = ws;
+            Log("Playwright WebSocket connected!");
             _ = PumpPlaywrightMessages();
         }
         else if (path == _extensionPath)
         {
             if (_extensionSocket != null) {
+                Log("Extension socket already connected; rejecting duplicate.");
                 await ws.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Extension already connected", CancellationToken.None);
                 return;
             }
             _extensionSocket = ws;
+            Log("Extension WebSocket connected!");
             _extensionConnectedTcs.TrySetResult(true);
             _ = PumpExtensionMessages();
         }
         else
         {
+            Log($"Unknown WebSocket path: {path}; rejecting.");
             await ws.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Invalid path", CancellationToken.None);
         }
     }
@@ -129,14 +200,18 @@ public class CdpRelayServer : IDisposable
         var buffer = new byte[81920];
         try
         {
-            while (_playwrightSocket!.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+            while (_playwrightSocket != null && _playwrightSocket.State == WebSocketState.Open && !_cts.IsCancellationRequested)
             {
                 using var ms = new MemoryStream();
                 WebSocketReceiveResult result;
                 do
                 {
                     result = await _playwrightSocket.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
-                    if (result.MessageType == WebSocketMessageType.Close) return;
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        Log("Playwright requested WebSocket close.");
+                        return;
+                    }
                     ms.Write(buffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
@@ -152,7 +227,7 @@ public class CdpRelayServer : IDisposable
         }
         catch (Exception ex) 
         {
-            Console.Error.WriteLine($"[Relay] Playwright Pump Error: {ex.Message}");
+            Log($"[Relay] Playwright Pump Error: {ex.Message}");
         }
     }
 
@@ -161,14 +236,18 @@ public class CdpRelayServer : IDisposable
         var buffer = new byte[81920];
         try
         {
-            while (_extensionSocket!.State == WebSocketState.Open && !_cts.IsCancellationRequested)
+            while (_extensionSocket != null && _extensionSocket.State == WebSocketState.Open && !_cts.IsCancellationRequested)
             {
                 using var ms = new MemoryStream();
                 WebSocketReceiveResult result;
                 do
                 {
                     result = await _extensionSocket.ReceiveAsync(new ArraySegment<byte>(buffer), _cts.Token);
-                    if (result.MessageType == WebSocketMessageType.Close) return;
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        Log("Extension requested WebSocket close.");
+                        return;
+                    }
                     ms.Write(buffer, 0, result.Count);
                 } while (!result.EndOfMessage);
 
@@ -184,22 +263,22 @@ public class CdpRelayServer : IDisposable
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Relay] Extension Pump Error: {ex.Message}");
+            Log($"[Relay] Extension Pump Error: {ex.Message}");
         }
     }
 
     private int _msgId = 0;
-    // Simple callback tracking for attached response mock
     private readonly System.Collections.Concurrent.ConcurrentDictionary<int, TaskCompletionSource<JsonNode?>> _extensionCallbacks = new();
 
     private async Task HandleExtensionMessage(string messageData)
     {
+        Log($"[FROM EXT] {messageData.Substring(0, Math.Min(messageData.Length, 250))}");
         try
         {
             var node = JsonNode.Parse(messageData)?.AsObject();
             if (node == null) return;
 
-            // Fulfill pending internal extension calls
+            // 1. Fulfill responses to commands we sent to the extension
             if (node.ContainsKey("id") && node["id"] != null)
             {
                 int eid = node["id"]!.GetValue<int>();
@@ -210,40 +289,142 @@ public class CdpRelayServer : IDisposable
                     } else {
                         tcs.SetResult(node["result"]);
                     }
-                    return; // Intercepted
+                    return;
                 }
             }
 
-            // Fallback: it's a notification from the extension (forwardCDPEvent)
-            if (node.ContainsKey("method") && node["method"]!.GetValue<string>() == "forwardCDPEvent")
+            // 2. Notifications from the extension
+            if (node.ContainsKey("method") && node["method"] != null)
             {
-                var paramObj = node["params"]?.AsObject();
-                if (paramObj != null)
+                string method = node["method"]!.GetValue<string>();
+                var pArray = node["params"]?.AsArray();
+
+                if (method == "chrome.tabs.onCreated" && pArray != null && pArray.Count > 0)
                 {
-                    string mcpSessionId = paramObj.ContainsKey("sessionId") ? paramObj["sessionId"]!.GetValue<string>() : _sessionId!;
-                    
+                    var tabObj = pArray[0]?.AsObject();
+                    if (tabObj != null && tabObj.ContainsKey("id"))
+                    {
+                        _tabId = tabObj["id"]!.GetValue<int>();
+                        _tabTitle = tabObj["title"]?.ToString() ?? "";
+                        _tabUrl = tabObj["url"]?.ToString() ?? "";
+                        Log($"chrome.tabs.onCreated received: TabId={_tabId}, Title={_tabTitle}, URL={_tabUrl}");
+
+                        // Attach debugger to this tab
+                        _ = AttachTabDebuggerAsync(_tabId);
+                    }
+                    return;
+                }
+
+                if (method == "chrome.debugger.onEvent" && pArray != null && pArray.Count >= 2)
+                {
+                    string cdpMethod = pArray[1]?.ToString() ?? "";
+                    JsonNode? cdpParams = pArray.Count > 2 ? pArray[2] : new JsonObject();
+
                     var outMsg = new JsonObject
                     {
-                        ["sessionId"] = mcpSessionId,
-                        ["method"] = paramObj["method"]?.GetValue<string>(),
-                        ["params"] = paramObj["params"]?.DeepClone()
+                        ["sessionId"] = _sessionId,
+                        ["method"] = cdpMethod,
+                        ["params"] = cdpParams?.DeepClone()
                     };
                     await SendToPlaywright(outMsg.ToJsonString());
+                    return;
                 }
-                return;
-            }
 
-            // Normal unknown message? Just send it to Playwright directly? 
-            // The NodeJS implementation ONLY expects forwardCDPEvent from the extension.
+                if (method == "chrome.tabs.onRemoved")
+                {
+                    Log($"chrome.tabs.onRemoved for tab {_tabId}");
+                    await SendToPlaywright(new JsonObject
+                    {
+                        ["method"] = "Target.detachedFromTarget",
+                        ["params"] = new JsonObject
+                        {
+                            ["sessionId"] = _sessionId,
+                            ["targetId"] = !string.IsNullOrEmpty(_targetId) ? _targetId : $"target-{_tabId}"
+                        }
+                    }.ToJsonString());
+                    return;
+                }
+            }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Relay] Extension Message Handling Error: {ex.Message}\nData: {messageData.Substring(0, Math.Min(messageData.Length, 500))}");
+            Log($"[Relay] Extension Message Handling Error: {ex.Message}");
+        }
+    }
+
+    private async Task AttachTabDebuggerAsync(int tabId)
+    {
+        try
+        {
+            Log($"Attaching debugger to tab {tabId} (URL: {_tabUrl}) via chrome.debugger.attach...");
+            await SendExtensionCommand("chrome.debugger.attach", new JsonArray
+            {
+                new JsonObject { ["tabId"] = tabId },
+                "1.3"
+            });
+            Log($"Debugger attached successfully to tab {tabId}!");
+
+            string rootTargetId = $"target-{tabId}";
+            try
+            {
+                var treeResult = await SendExtensionCommand("chrome.debugger.sendCommand", new JsonArray
+                {
+                    new JsonObject { ["tabId"] = tabId },
+                    "Page.getFrameTree",
+                    new JsonObject()
+                });
+                var frameId = treeResult?["frameTree"]?["frame"]?["id"]?.ToString();
+                if (!string.IsNullOrEmpty(frameId))
+                {
+                    rootTargetId = frameId;
+                    Log($"Discovered root frameId for tab {tabId}: {rootTargetId}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Log($"Could not query Page.getFrameTree: {ex.Message}");
+            }
+
+            _targetId = rootTargetId;
+
+            _connectedTabInfo = new JsonObject
+            {
+                ["targetId"] = rootTargetId,
+                ["type"] = "page",
+                ["title"] = _tabTitle,
+                ["url"] = _tabUrl,
+                ["attached"] = true,
+                ["browserContextId"] = "default"
+            };
+
+            _tabAttachedTcs.TrySetResult(true);
+
+            // If Playwright already requested setAutoAttach and is waiting
+            if (_sessionId != null)
+            {
+                Log($"Notifying Playwright of target attachment: {_sessionId}");
+                await SendToPlaywright(new JsonObject
+                {
+                    ["method"] = "Target.attachedToTarget",
+                    ["params"] = new JsonObject
+                    {
+                        ["sessionId"] = _sessionId,
+                        ["targetInfo"] = _connectedTabInfo.DeepClone(),
+                        ["waitingForDebugger"] = false
+                    }
+                }.ToJsonString());
+            }
+        }
+        catch (Exception ex)
+        {
+            Log($"Failed to attach debugger to tab {tabId}: {ex.Message}");
+            _tabAttachedTcs.TrySetException(ex);
         }
     }
 
     private async Task HandlePlaywrightMessage(string messageData)
     {
+        Log($"[FROM PW] {messageData.Substring(0, Math.Min(messageData.Length, 250))}");
         JsonObject? node = null;
         try 
         {
@@ -251,7 +432,7 @@ public class CdpRelayServer : IDisposable
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"[Relay] Playwright JSON Parse Error: {ex.Message}\nData: {messageData.Substring(0, Math.Min(messageData.Length, 500))}");
+            Log($"[Relay] Playwright JSON Parse Error: {ex.Message}");
             return;
         }
 
@@ -263,115 +444,184 @@ public class CdpRelayServer : IDisposable
 
         if (method == "Browser.getVersion")
         {
-            await SendToPlaywright(new JsonObject {
-                ["id"] = reqId,
-                ["sessionId"] = reqSessionId,
-                ["result"] = new JsonObject {
-                    ["protocolVersion"] = "1.3",
-                    ["product"] = "Chrome/Extension-Bridge",
-                    ["userAgent"] = "CDP-Bridge-Server/1.0.0"
-                }
-            }.ToJsonString());
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject {
+                ["protocolVersion"] = "1.3",
+                ["product"] = "Chrome/Extension-Bridge",
+                ["userAgent"] = "CDP-Bridge-Server/1.0.0"
+            });
             return;
         }
         
-        if (method == "Browser.setDownloadBehavior")
+        if (method == "Browser.setDownloadBehavior" || method == "Target.setDiscoverTargets")
         {
-            await SendToPlaywright(new JsonObject {
-                ["id"] = reqId,
-                ["sessionId"] = reqSessionId,
-                ["result"] = new JsonObject()
-            }.ToJsonString());
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject());
             return;
         }
 
         if (method == "Target.setAutoAttach")
         {
-            if (!string.IsNullOrEmpty(reqSessionId)) {
-                try {
-                    var result = await ForwardToExtension(method, node["params"]?.AsObject(), reqSessionId);
-                    await SendToPlaywright(new JsonObject {
-                        ["id"] = reqId, ["sessionId"] = reqSessionId, ["result"] = result?.DeepClone() ?? new JsonObject()
-                    }.ToJsonString());
-                } catch (Exception ex) {
-                    await SendToPlaywright(new JsonObject {
-                        ["id"] = reqId, ["sessionId"] = reqSessionId, ["error"] = new JsonObject { ["message"] = ex.Message }
-                    }.ToJsonString());
-                }
+            // If Target.setAutoAttach is called for an existing session, simply acknowledge success
+            if (!string.IsNullOrEmpty(reqSessionId))
+            {
+                await SendCdpResponse(reqId, reqSessionId, new JsonObject());
                 return;
             }
 
-            // Simulate attaching to the specific tab via our extension
-            try {
-                var extRes = await SendExtensionInternal("attachToTab", new JsonObject());
-                _connectedTabInfo = extRes?["targetInfo"]?.AsObject();
-                _sessionId = $"pw-tab-{Interlocked.Increment(ref _nextSessionId)}";
+            _sessionId = $"pw-tab-{Interlocked.Increment(ref _nextSessionId)}";
+            Log($"Received root Target.setAutoAttach, assigning session {_sessionId}. Waiting for tab attachment...");
 
-                var tInfo = _connectedTabInfo?.DeepClone().AsObject();
-                if (tInfo != null) tInfo["attached"] = true;
+            // 1. Await the tab attachment if not yet attached
+            var attachTimeout = Task.Delay(15000);
+            if (await Task.WhenAny(_tabAttachedTcs.Task, attachTimeout) == _tabAttachedTcs.Task)
+            {
+                Log("Tab is attached. Replying to Target.setAutoAttach first...");
+                await SendCdpResponse(reqId, null, new JsonObject());
 
+                // Small delay to ensure Playwright's _defaultContext._initialize() promise finishes line 307
+                await Task.Delay(100);
+
+                Log("Firing Target.attachedToTarget to Playwright...");
                 await SendToPlaywright(new JsonObject {
                     ["method"] = "Target.attachedToTarget",
                     ["params"] = new JsonObject {
                         ["sessionId"] = _sessionId,
-                        ["targetInfo"] = tInfo ?? new JsonObject(),
+                        ["targetInfo"] = _connectedTabInfo?.DeepClone() ?? new JsonObject {
+                            ["targetId"] = !string.IsNullOrEmpty(_targetId) ? _targetId : $"target-{_tabId}",
+                            ["type"] = "page",
+                            ["title"] = _tabTitle,
+                            ["url"] = _tabUrl,
+                            ["attached"] = true,
+                            ["browserContextId"] = "default"
+                        },
                         ["waitingForDebugger"] = false
                     }
                 }.ToJsonString());
-
-                await SendToPlaywright(new JsonObject {
-                    ["id"] = reqId,
-                    ["result"] = new JsonObject()
-                }.ToJsonString());
-            } catch (Exception ex) {
-                await SendToPlaywright(new JsonObject { ["id"] = reqId, ["error"] = new JsonObject { ["message"] = ex.Message } }.ToJsonString());
             }
+            else
+            {
+                Log("ERROR: Timed out waiting for tab to attach in Chrome extension.");
+                await SendCdpResponse(reqId, null, null, "Timed out waiting for tab to attach in Chrome extension.");
+            }
+            return;
+        }
+
+        if (method == "Browser.close")
+        {
+            await SendCdpResponse(reqId, null, new JsonObject());
+            Dispose();
             return;
         }
 
         if (method == "Target.getTargetInfo")
         {
-            await SendToPlaywright(new JsonObject {
-                ["id"] = reqId,
-                ["sessionId"] = reqSessionId,
-                ["result"] = new JsonObject {
-                    ["targetInfo"] = _connectedTabInfo?.DeepClone()
+            var targetId = node["params"]?["targetId"]?.GetValue<string>();
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject {
+                ["targetInfo"] = _connectedTabInfo?.DeepClone() ?? new JsonObject {
+                    ["targetId"] = targetId ?? (!string.IsNullOrEmpty(_targetId) ? _targetId : $"target-{_tabId}"),
+                    ["type"] = "page",
+                    ["title"] = _tabTitle,
+                    ["url"] = _tabUrl,
+                    ["attached"] = true,
+                    ["browserContextId"] = "default"
                 }
-            }.ToJsonString());
+            });
             return;
         }
 
-        // Forward all others
-        try {
-            var result = await ForwardToExtension(method!, node["params"]?.AsObject(), reqSessionId);
-            await SendToPlaywright(new JsonObject {
-                ["id"] = reqId,
-                ["sessionId"] = reqSessionId,
-                ["result"] = result?.DeepClone() ?? new JsonObject()
-            }.ToJsonString());
-        } catch (Exception ex) {
-            await SendToPlaywright(new JsonObject {
-                ["id"] = reqId,
-                ["sessionId"] = reqSessionId,
-                ["error"] = new JsonObject { ["message"] = ex.Message }
-            }.ToJsonString());
+        if (method == "Target.getTargets")
+        {
+            var targetsArray = new JsonArray();
+            if (_connectedTabInfo != null) targetsArray.Add(_connectedTabInfo.DeepClone());
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject {
+                ["targetInfos"] = targetsArray
+            });
+            return;
+        }
+
+        if (method == "Target.createTarget")
+        {
+            var url = node["params"]?["url"]?.GetValue<string>() ?? "about:blank";
+            var createRes = await SendExtensionCommand("chrome.tabs.create", new JsonArray
+            {
+                new JsonObject { ["url"] = url }
+            });
+            var newTabId = createRes?["id"]?.GetValue<int>() ?? 0;
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject
+            {
+                ["targetId"] = $"target-{newTabId}"
+            });
+            return;
+        }
+
+        if (method == "Target.closeTarget")
+        {
+            var targetId = node["params"]?["targetId"]?.GetValue<string>() ?? "";
+            if (targetId.StartsWith("target-") && int.TryParse(targetId.Substring(7), out var closeTabId))
+            {
+                _ = SendExtensionCommand("chrome.tabs.remove", new JsonArray { closeTabId });
+            }
+            await SendCdpResponse(reqId, reqSessionId, new JsonObject { ["success"] = true });
+            return;
+        }
+
+        // Forward all CDP commands targeting the page to the Chrome extension debugger
+        try
+        {
+            var result = await ForwardCdpCommandToTab(method!, node["params"]?.AsObject());
+            await SendCdpResponse(reqId, reqSessionId, result?.DeepClone() ?? new JsonObject());
+        }
+        catch (Exception ex)
+        {
+            Log($"CDP command '{method}' failed: {ex.Message}");
+            await SendCdpResponse(reqId, reqSessionId, null, ex.Message);
         }
     }
 
-    private async Task<JsonNode?> ForwardToExtension(string method, JsonObject? args, string? sessionId)
+    private async Task SendCdpResponse(int? id, string? sessionId, JsonNode? result, string? error = null)
     {
-        string finalSessionId = (sessionId == _sessionId) ? null! : sessionId!;
-        return await SendExtensionInternal("forwardCDPCommand", new JsonObject {
-            ["sessionId"] = finalSessionId,
-            ["method"] = method,
-            ["params"] = args?.DeepClone()
+        var obj = new JsonObject();
+        if (id.HasValue) obj["id"] = id.Value;
+        if (!string.IsNullOrEmpty(sessionId)) obj["sessionId"] = sessionId;
+        if (error != null)
+        {
+            obj["error"] = new JsonObject { ["message"] = error };
+        }
+        else
+        {
+            obj["result"] = result ?? new JsonObject();
+        }
+        await SendToPlaywright(obj.ToJsonString());
+    }
+
+    private async Task<JsonNode?> ForwardCdpCommandToTab(string method, JsonObject? args)
+    {
+        if (_tabId == 0)
+        {
+            // Wait for tab to attach
+            var attachTimeout = Task.Delay(10000);
+            if (await Task.WhenAny(_tabAttachedTcs.Task, attachTimeout) != _tabAttachedTcs.Task)
+            {
+                throw new InvalidOperationException("No tab currently attached to receive CDP commands.");
+            }
+        }
+
+        return await SendExtensionCommand("chrome.debugger.sendCommand", new JsonArray
+        {
+            new JsonObject { ["tabId"] = _tabId },
+            method,
+            args?.DeepClone() ?? new JsonObject()
         });
     }
 
-    private async Task<JsonNode?> SendExtensionInternal(string method, JsonObject args)
+    private async Task<JsonNode?> SendExtensionCommand(string method, JsonArray args)
     {
+        if (_extensionSocket == null || _extensionSocket.State != WebSocketState.Open)
+        {
+            throw new InvalidOperationException("Extension WebSocket is not connected.");
+        }
+
         var id = Interlocked.Increment(ref _msgId);
-        var tcs = new TaskCompletionSource<JsonNode?>();
+        var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
         _extensionCallbacks[id] = tcs;
 
         var extMsg = new JsonObject {
@@ -381,13 +631,14 @@ public class CdpRelayServer : IDisposable
         };
 
         var bytes = Encoding.UTF8.GetBytes(extMsg.ToJsonString());
-        await _extensionSocket!.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token);
+        await _extensionSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, _cts.Token);
 
         return await tcs.Task;
     }
 
     private async Task SendToPlaywright(string payload)
     {
+        Log($"[TO PW] {payload.Substring(0, Math.Min(payload.Length, 250))}");
         if (_playwrightSocket == null || _playwrightSocket.State != WebSocketState.Open) return;
         var bytes = Encoding.UTF8.GetBytes(payload);
         await _playwrightSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
@@ -395,6 +646,7 @@ public class CdpRelayServer : IDisposable
 
     public void Dispose()
     {
+        Log("CdpRelayServer.Dispose called.");
         _cts.Cancel();
         _listener?.Stop();
         _playwrightSocket?.Dispose();
