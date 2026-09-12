@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using ModelContextProtocol.Server;
@@ -23,6 +23,11 @@ for (int i = 0; i < args.Length; i++)
     else if (string.Equals(a, "--headless", StringComparison.OrdinalIgnoreCase))
     {
         headlessFlag = true;
+    }
+    else if (string.Equals(a, "--test", StringComparison.OrdinalIgnoreCase))
+    {
+        await TestRunner.RunAsync();
+        return;
     }
 }
 
